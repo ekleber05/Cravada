@@ -58,6 +58,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+async def menu_principal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /menu — atalho pro menu principal"""
+    keyboard = [
+        [InlineKeyboardButton("🏀 Picks de hoje", callback_data="picks_hoje")],
+        [InlineKeyboardButton("🏥 Jogadores lesionados", callback_data="lesionados_menu")],
+    ]
+    await update.message.reply_text(
+        "🏀 *Cravada — Menu principal*\n\nO que você quer ver?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
 
 # ─────────────────────────────────────────
 # INJURIES
@@ -427,6 +439,7 @@ def main():
 
     # Handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_principal_cmd))
     app.add_handler(CommandHandler("status", admin_status))
     app.add_handler(CommandHandler("broadcast", admin_broadcast))
 
