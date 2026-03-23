@@ -15,8 +15,12 @@ CACHE_FILE = "data/injuries_cache.json"
 # NBA publica entre 4-5 PDFs por dia nesse formato de URL
 NBA_INJURY_BASE = "https://ak-static.cms.nba.com/referee/injury/Injury-Report_{date}_{time}.pdf"
 
-# Horários que a NBA costuma publicar os PDFs
-NBA_REPORT_TIMES = ["01_00PM", "05_00PM", "06_15PM", "07_00PM", "08_00PM"]
+# Horários que a NBA costuma publicar — cobre formatos com e sem minutos
+NBA_REPORT_TIMES = [
+    "01PM", "02PM", "03PM", "04PM", "05PM", "06PM", "07PM", "08PM", "09PM", "10PM",
+    "01_00PM", "02_00PM", "03_00PM", "04_00PM", "05_00PM", "06_00PM", "07_00PM", "08_00PM",
+    "06_15PM", "06_30PM", "07_30PM", "08_30PM",
+]
 
 
 def _download_pdf(url: str) -> BytesIO | None:
