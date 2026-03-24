@@ -2,6 +2,7 @@ import requests
 import pdfplumber
 import os
 import json
+import re
 import logging
 from datetime import datetime, date
 from io import BytesIO
@@ -58,59 +59,157 @@ def _download_pdf(url: str) -> BytesIO | None:
     return None
 
 
+def _normalize_name(raw: str) -> str:
+    """Converte 'Last, First' para 'First Last'"""
+    raw = raw.strip()
+    if "," in raw:
+        parts = raw.split(",", 1)
+        return f"{parts[1].strip()} {parts[0].strip()}"
+    return raw
+
+
 def _parse_pdf(pdf_bytes: BytesIO) -> list:
+    """
+    Parseia o PDF oficial da NBA Injury Report.
+
+    Formato real confirmado no PDF:
+    Colunas: Game Date | Game Time | Matchup | Team | Player Name | Current Status | Reason
+    - O time aparece apenas na primeira linha do grupo; linhas seguintes do mesmo time ficam vazias
+    - Nomes no formato: "Last, First" (ex: "Haliburton, Tyrese")
+    - Status: Out | Questionable | Doubtful | Available | Probable
+    """
     players = []
-    status_keywords = ["Out", "Questionable", "Doubtful", "Available", "Probable"]
+    status_keywords = {"Out", "Questionable", "Doubtful", "Available", "Probable"}
 
     try:
         with pdfplumber.open(pdf_bytes) as pdf:
             for page in pdf.pages:
-                # Tenta extrair por tabela primeiro
+                page_players = []
+
+                # ── Método 1: tabela estruturada ─────────────────────────────
                 table = page.extract_table()
                 if table:
+                    current_team = ""
                     for row in table:
-                        if not row or len(row) < 5:
+                        if not row:
                             continue
-                        try:
-                            row = [str(c).strip() if c else "" for c in row]
-                            for i, cell in enumerate(row):
-                                if cell in status_keywords and i >= 2:
-                                    player_name = row[i - 1]
-                                    team = row[i - 2]
-                                    reason = row[i + 1] if i + 1 < len(row) else "Não informado"
-                                    if player_name and len(player_name.split()) >= 2:
-                                        players.append({
-                                            "name": player_name,
-                                            "team": team,
-                                            "status": cell,
-                                            "reason": reason
-                                        })
-                                    break
-                        except Exception:
+                        cells = [str(c).strip() if c else "" for c in row]
+
+                        # Pula cabeçalho e linhas sem dados úteis
+                        joined = " ".join(cells)
+                        if any(h in joined for h in ["Game Date", "Player Name", "Current Status"]):
+                            continue
+                        if "NOT YET SUBMITTED" in joined:
                             continue
 
-                # Fallback por texto
-                if not players:
-                    text = page.extract_text() or ""
-                    for line in text.split("\n"):
-                        parts = [p.strip() for p in line.split("  ") if p.strip()]
-                        for i, part in enumerate(parts):
-                            if part in status_keywords and i >= 2:
-                                player_name = parts[i - 1]
-                                team = parts[i - 2]
-                                reason = parts[i + 1] if i + 1 < len(parts) else "Não informado"
-                                if len(player_name.split()) >= 2:
-                                    players.append({
-                                        "name": player_name,
-                                        "team": team,
-                                        "status": part,
-                                        "reason": reason
-                                    })
+                        # Encontra a coluna de status
+                        status = None
+                        status_idx = None
+                        for i, cell in enumerate(cells):
+                            if cell in status_keywords:
+                                status = cell
+                                status_idx = i
                                 break
+
+                        if status is None or status_idx is None:
+                            continue
+
+                        # Nome: coluna imediatamente antes do status
+                        player_raw = cells[status_idx - 1] if status_idx >= 1 else ""
+
+                        # Time: 2 colunas antes do status (ou mantém o último time visto)
+                        team_candidate = cells[status_idx - 2] if status_idx >= 2 else ""
+                        if team_candidate and team_candidate not in status_keywords:
+                            # Não atualiza o time se for uma data ou matchup
+                            if not re.match(r'\d{2}/\d{2}/\d{4}', team_candidate) and '@' not in team_candidate:
+                                current_team = team_candidate
+
+                        # Motivo: coluna após o status
+                        reason = ""
+                        if status_idx + 1 < len(cells):
+                            reason = cells[status_idx + 1]
+                        if not reason:
+                            reason = "Não informado"
+
+                        player_name = _normalize_name(player_raw)
+                        if not player_name or len(player_name.split()) < 2:
+                            continue
+
+                        page_players.append({
+                            "name": player_name,
+                            "team": current_team,
+                            "status": status,
+                            "reason": reason
+                        })
+
+                # ── Método 2: texto linha a linha (fallback) ─────────────────
+                if not page_players:
+                    text = page.extract_text() or ""
+                    current_team = ""
+
+                    for line in text.split("\n"):
+                        line = line.strip()
+                        if not line or "NOT YET SUBMITTED" in line:
+                            continue
+                        if any(h in line for h in ["Game Date", "Game Time", "Player Name", "Current Status"]):
+                            continue
+
+                        # Detecta status na linha
+                        found_status = None
+                        for kw in status_keywords:
+                            if re.search(rf'\b{kw}\b', line):
+                                found_status = kw
+                                break
+
+                        if not found_status:
+                            continue
+
+                        parts = re.split(rf'\b{found_status}\b', line, maxsplit=1)
+                        before = parts[0].strip()
+                        after = parts[1].strip() if len(parts) > 1 else "Não informado"
+
+                        # Procura padrão "Sobrenome, Nome" no before
+                        name_match = re.search(
+                            r'([A-Z][a-zA-Z\'\-\.]+(?:\s+[A-Z][a-zA-Z\'\-\.]+)*,\s*[A-Z][a-zA-Z\'\-\.]+(?:\s+[A-Z][a-zA-Z\'\-\.]+)*)\s*$',
+                            before
+                        )
+                        if name_match:
+                            player_raw = name_match.group(1)
+                            player_name = _normalize_name(player_raw)
+                            team_part = before[:name_match.start()].strip()
+                            if team_part and not re.match(r'\d{2}/\d{2}', team_part) and '@' not in team_part:
+                                current_team = team_part
+                        else:
+                            words = before.split()
+                            if len(words) < 2:
+                                continue
+                            player_name = " ".join(words[-2:])
+                            team_part = " ".join(words[:-2])
+                            if team_part and '@' not in team_part:
+                                current_team = team_part
+
+                        if len(player_name.split()) < 2:
+                            continue
+
+                        page_players.append({
+                            "name": player_name,
+                            "team": current_team,
+                            "status": found_status,
+                            "reason": after or "Não informado"
+                        })
+
+                players.extend(page_players)
+
     except Exception as e:
         logger.error(f"Erro ao parsear PDF: {e}")
 
-    return players
+    # Deduplica por nome, mantendo último status
+    seen = {}
+    for p in players:
+        seen[p["name"].lower()] = p
+    result = list(seen.values())
+    logger.info(f"PDF parseado: {len(result)} jogadores encontrados")
+    return result
 
 
 def _load_cache() -> dict:
@@ -156,11 +255,9 @@ def _check_and_cancel_picks(updated_players: dict) -> list:
     picks_cache = "data/picks_cache.json"
     if not os.path.exists(picks_cache):
         return []
-
     try:
         with open(picks_cache) as f:
             data = json.load(f)
-
         if data.get("date") != date.today().isoformat():
             return []
 
@@ -172,9 +269,7 @@ def _check_and_cancel_picks(updated_players: dict) -> list:
         for pick in picks:
             player_name = pick.get("jogador", "")
             player_data = updated_players.get(player_name)
-            if (player_data and
-                    player_data["status"] == "Out" and
-                    player_name not in already_cancelled):
+            if player_data and player_data["status"] == "Out" and player_name not in already_cancelled:
                 cancelled.append({
                     "jogador": player_name,
                     "mercado": pick.get("mercado", ""),
@@ -190,17 +285,13 @@ def _check_and_cancel_picks(updated_players: dict) -> list:
             _save_cancelled_picks(_load_cancelled_picks() + cancelled)
 
         return cancelled
-
     except Exception as e:
-        logger.error(f"Erro ao checar picks para cancelar: {e}")
+        logger.error(f"Erro ao checar picks: {e}")
         return []
 
 
 async def poll_new_injury_reports() -> dict:
-    """
-    Verifica se saiu algum PDF novo da NBA.
-    Retorna: found, new_players, cancelled_picks, source_url, pdfs_found_count
-    """
+    """Verifica PDFs novos da NBA e atualiza o cache"""
     today = datetime.now().strftime("%Y-%m-%d")
     candidate_urls = _build_candidate_urls(today)
     processed_urls = _load_processed_urls()
@@ -230,9 +321,9 @@ async def poll_new_injury_reports() -> dict:
     # Detecta mudanças relevantes
     changed = []
     for name, new_data in all_new_players.items():
-        old = current_players.get(name)
-        if new_data["status"] not in ["Out", "Questionable", "Doubtful"]:
+        if new_data["status"] not in {"Out", "Questionable", "Doubtful"}:
             continue
+        old = current_players.get(name)
         if old is None:
             changed.append({**new_data, "change": "novo"})
         elif old["status"] != new_data["status"]:
@@ -254,7 +345,7 @@ async def poll_new_injury_reports() -> dict:
 
 
 async def refresh_injury_list() -> dict:
-    """Alias público para poll — força varredura completa"""
+    """Força varredura completa dos PDFs de hoje"""
     return await poll_new_injury_reports()
 
 
@@ -279,26 +370,28 @@ def get_injury_list(team_abbr: str = None) -> list:
         team_name = team_names.get(team_abbr, team_abbr)
         players = [p for p in players if team_name.lower() in p.get("team", "").lower()]
 
-    return [p for p in players if p["status"] in ["Out", "Questionable", "Doubtful"]]
+    return [p for p in players if p["status"] in {"Out", "Questionable", "Doubtful"}]
 
 
 def get_last_update_info() -> dict:
     cache = _load_cache()
     last = cache.get("last_updated")
     url = cache.get("last_url", "")
-    count = len([p for p in cache.get("players", []) if p["status"] in ["Out", "Questionable", "Doubtful"]])
+    count = len([p for p in cache.get("players", []) if p["status"] in {"Out", "Questionable", "Doubtful"}])
 
+    formatted = "Nunca"
     if last:
-        dt = datetime.fromisoformat(last)
-        formatted = dt.strftime("%d/%m %H:%M")
-    else:
-        formatted = "Nunca"
+        try:
+            dt = datetime.fromisoformat(last)
+            formatted = dt.strftime("%d/%m %H:%M")
+        except Exception:
+            formatted = last
 
     pdf_time = ""
     if url:
         try:
-            part = url.split("_")[-1].replace(".pdf", "").replace("_", ":")
-            pdf_time = f" (PDF das {part})"
+            part = url.split("Injury-Report_")[1].replace(".pdf", "").split("_", 2)[-1]
+            pdf_time = f" (PDF {part})"
         except Exception:
             pass
 
